@@ -176,48 +176,56 @@ def handle_update():
         if 'message' in r and 'text' in r['message']:
             message_api = r['message']['text']
             if 'reply_to_message' in r['message']:
+                print(r['message'])
                 if r['message']['reply_to_message']:
-                    reply_text = r['message']['reply_to_message']['text']
-                    message_to_reply = ''
-                    # Check if the message is a reply to a Telegram bot message
-                    print('replied!')
-                    if message_api.startswith('/@'):
-                        thread_name = reply_text
-                        conn = sqlite3.connect('mentions.db')
-                        c = conn.cursor()
-                        c.execute("SELECT * FROM mention_mapping")
-                        rows = c.fetchall()
-                        mention_message = message_api.replace('/', '')
-                        print(mention_message)
-                        for row in rows:
-                            trigger_word = row[1]
-                            tg_username = row[2]
-                            print(trigger_word, tg_username)
-                            if tg_username == mention_message:
-                                message_to_reply = trigger_word
-                        c.close()
-                        get_channel_name = re.search(r'на канале (\w+)', thread_name)
-                        if get_channel_name:
-                            got_channel_name_to_reply = get_channel_name.group(1)
-                            channel_id_to_reply = get_channel_id_by_name(got_channel_name_to_reply)  # channel_id
-                            #   obj=post_id - Создан тред...obj=... , чтобы отвечать на конкретный тред, если их имена дублируются
-                            if not unique_thread_names:
-                                pattern = r'obj=(\w+)'
-                                print(thread_name)
-                                match = re.search(pattern, thread_name)
-                                print(match)
-                                if match:
-                                    get_thread_id_by_pattern = match.group(1)
-                                    post_to_mattermost(channel_id_to_reply, get_thread_id_by_pattern, message_to_reply)
-                                    print(get_thread_id_by_pattern)
-                                    #   если имена уникальны
-                                else:
-                                    thread_id_to_reply = get_thread_id(thread_name, channel_id_to_reply)  # thread_id
-                                    post_to_mattermost(channel_id_to_reply, thread_id_to_reply, message_to_reply)
+                    print(r['message']['reply_to_message'])
+                    try:
+                        reply_text = r['message']['reply_to_message']['text']
+                        message_to_reply = ''
+                        # Check if the message is a reply to a Telegram bot message
+                        print('replied!')
+                        if message_api.startswith('/@'):
+                            thread_name = reply_text
+                            conn = sqlite3.connect('mentions.db')
+                            c = conn.cursor()
+                            c.execute("SELECT * FROM mention_mapping")
+                            rows = c.fetchall()
+                            mention_message = message_api.replace('/', '')
+                            print(mention_message)
+                            for row in rows:
+                                trigger_word = row[1]
+                                tg_username = row[2]
+                                print(trigger_word, tg_username)
+                                if tg_username == mention_message:
+                                    message_to_reply = trigger_word
+                            c.close()
+                            get_channel_name = re.search(r'на канале (\w+)', thread_name)
+                            if get_channel_name:
+                                got_channel_name_to_reply = get_channel_name.group(1)
+                                channel_id_to_reply = get_channel_id_by_name(got_channel_name_to_reply)  # channel_id
+                                #   obj=post_id - Создан тред...obj=... , чтобы отвечать на конкретный тред, если их имена дублируются
+                                if not unique_thread_names:
+                                    pattern = r'obj=(\w+)'
+                                    print(thread_name)
+                                    match = re.search(pattern, thread_name)
+                                    print(match)
+                                    if match:
+                                        get_thread_id_by_pattern = match.group(1)
+                                        post_to_mattermost(channel_id_to_reply, get_thread_id_by_pattern,
+                                                           message_to_reply)
+                                        print(get_thread_id_by_pattern)
+                                        #   если имена уникальны
+                                    else:
+                                        thread_id_to_reply = get_thread_id(thread_name,
+                                                                           channel_id_to_reply)  # thread_id
+                                        post_to_mattermost(channel_id_to_reply, thread_id_to_reply, message_to_reply)
+                            else:
+                                print('Not posted!')
                         else:
-                            print('Not posted!')
-                    else:
-                        print('No reply!')
+                            print('No reply!')
+                    except KeyError as ke:
+                        print('KeyEror: [text] not found')
+
         return jsonify(r)
 
 
