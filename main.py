@@ -1,233 +1,394 @@
+import logging
 from flask import Flask, request, jsonify
-import telebot
-import re
-import envparse
-from telebot import TeleBot
 import requests
-import sqlite3
-import func
+import time
+import envparse
+from threading import Thread, Event, Lock
+from datetime import datetime, timedelta, timezone
+import telebot
+from queue import Queue
+from hashlib import md5
+import pytz
 
-production = True
-unique_thread_names = False
-envparse.env.read_envfile()
-telegram_token_prod: str = envparse.env.str("telegram_token_prod")
-telegram_token_dev: str = envparse.env.str("telegram_token_dev")
-mattermost_bearer_token: str = envparse.env.str("mattermost_bearer_token")
-mattermost_server_url: str = envparse.env.str("mattermost_server_url")
-prod_tg_chat: str = envparse.env.str("prod_tg_chat")
-test_tg_chat: str = envparse.env.str("test_tg_chat")
-mattermost_team_id: str = envparse.env.str("mattermost_team_id")
-if production:
-    bot = TeleBot(telegram_token_prod, threaded=False)
-    print('prod')
-else:
-    bot = TeleBot(telegram_token_dev, threaded=False)
-    print('dev')
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
+class Config:
+    """Класс для хранения конфигурации"""
+    def __init__(self):
+        envparse.env.read_envfile()
+        # Mattermost
+        self.mattermost_server_url = envparse.env.str("MATTERMOST_SERVER_URL")
+        self.channel_id = envparse.env.str("MATTERMOST_CHANNEL_ID")
+        self.mattermost_bearer_token = envparse.env.str("MATTERMOST_BEARER_TOKEN")
+        self.bot_user_id = envparse.env.str("MATTERMOST_BOT_USER_ID")
+        
+        # Telegram
+        self.telegram_bot_token = envparse.env.str("TELEGRAM_BOT_TOKEN")
+        self.telegram_chat_id = envparse.env.str("TELEGRAM_CHAT_ID")
+        self.manager_chat_id = envparse.env.str("MANAGER_CHAT_ID")
+        
+        # Временные зоны
+        self.ekb_tz = pytz.timezone('Asia/Yekaterinburg')
+        self.msk_tz = pytz.timezone('Europe/Moscow')
+        
+        # Настройки времени
+        self.non_working_hours = {
+            'ekb': {'start': 6, 'end': 10},  # 6-8 утра ЕКБ
+            'msk': {'start': 6, 'end': 10}   # 8-10 утра МСК
+        }
+        
+        # Внедренцы
+        self.implementers = {
+            'ekb': ['user1_id', 'user2_id'],
+            'msk': ['user3_id', 'user4_id']
+        }
 
-conn = sqlite3.connect('mentions.db')
-c = conn.cursor()
-
-c.execute(func.create_mention_mapping)
-conn.commit()
-c.execute(func.create_mask_regions)
-conn.commit()
-c.close()
-
-headers = {
-    'Authorization': 'Bearer {}'.format(mattermost_bearer_token),
-    'X-Requested-With': 'XMLHttpRequest'
-}
-get_root_id = ''
-get_root_name = ''
-get_channel_id = ''
-got_channel_name_to_reply = ''
-
-
-def get_channel_name(channel_id):
-    api_url = '{}/api/v4/channels/{}'.format(mattermost_server_url, channel_id)
-    response = requests.get(api_url, headers=headers)
-    if response.status_code == 200:
-        return response.json().get('display_name', '')
-    return ''
-
-
-def get_data_from_mattermost_post(data):
-    post_id_url = '{}/api/v4/posts/{}'.format(mattermost_server_url, data['post_id'])
-    get_channel_id = data['channel_id']
-    r_post_id = requests.get(post_id_url, headers=headers)
-    get_post_id = r_post_id.json()
-    get_post_r_id = get_post_id['id']
-    get_root_id = get_post_id['root_id']
-    root_id_url = '{}/api/v4/posts/{}'.format(mattermost_server_url, get_root_id)
-    r_root_id = requests.get(root_id_url, headers=headers)
-    get_root_id = r_root_id.json()
-    get_root_name = get_root_id['message']
-    channel_name = get_channel_name(data['channel_id'])
-
-    return get_root_name, channel_name, get_post_r_id
-
-
-@app.route('/callback', methods=['POST'])
-def callback_handler():
-    data = request.get_json()
-    if 'trigger_word' in data:
-        #   вебхук на тег юзернейма в mattermost
-        if str(data['text']).startswith('@'):
-            get_root_name, channel_name, get_post_r_id = get_data_from_mattermost_post(data)
-            conn = sqlite3.connect('mentions.db')
-            c = conn.cursor()
-            c.execute("SELECT * FROM mention_mapping")
-            rows = c.fetchall()
-            for row in rows:
-                trigger_word = row[1]
-                tg_username = row[2]
-                if trigger_word in data.get('text', ''):
-                    message = func.mentiontext.format(tg_username, get_root_name, channel_name, data['text'])
-                    send_telegram_message(message)
-            c.close()
+class MessageProcessor:
+    """Обработчик сообщений с расширенной функциональностью"""
+    def __init__(self, config: Config):
+        self.config = config
+        self.telegram_bot = telebot.TeleBot(config.telegram_bot_token)
+        self.message_queue = Queue(maxsize=100)
+        self.processed_messages = set()
+        self.pending_responses = {}
+        self.lock = Lock()
+        
+        # Инициализация Telegram бота
+        self._setup_telegram_handlers()
+    
+    def _setup_telegram_handlers(self):
+        """Настройка обработчиков команд Telegram"""
+        @self.telegram_bot.message_handler(func=lambda message: True)
+        def handle_message(message):
+            if message.reply_to_message and message.reply_to_message.message_id in self.pending_responses:
+                original_msg = self.pending_responses[message.reply_to_message.message_id]
+                self._send_to_mattermost(
+                    original_msg['channel_id'],
+                    f"Ответ от внедренца: {message.text}",
+                    original_msg['post_id']
+                )
+                self.telegram_bot.send_message(
+                    message.chat.id,
+                    "Ваш ответ отправлен в Mattermost!",
+                    reply_to_message_id=message.message_id
+                )
+    
+    def _get_message_hash(self, message: str, channel_id: str, post_id: str) -> str:
+        """Генерирует уникальный хеш для сообщения"""
+        return md5(f"{message}-{channel_id}-{post_id}".encode()).hexdigest()
+    
+    def _is_non_working_time(self) -> bool:
+        """Проверяет, находится ли текущее время в нерабочих часах"""
+        now_ekb = datetime.now(self.config.ekb_tz)
+        now_msk = datetime.now(self.config.msk_tz)
+        
+        ekb_hour = now_ekb.hour
+        msk_hour = now_msk.hour
+        
+        ekb_time = self.config.non_working_hours['ekb']
+        msk_time = self.config.non_working_hours['msk']
+        
+        return (ekb_time['start'] <= ekb_hour < ekb_time['end'] or 
+                msk_time['start'] <= msk_hour < msk_time['end'])
+    
+    def _get_implementers(self) -> list:
+        """Возвращает список внедренцев для текущего времени"""
+        now_ekb = datetime.now(self.config.ekb_tz).hour
+        now_msk = datetime.now(self.config.msk_tz).hour
+        
+        if self.config.non_working_hours['ekb']['start'] <= now_ekb < self.config.non_working_hours['ekb']['end']:
+            return self.config.implementers['ekb']
         else:
-            get_root_name, channel_name, get_post_r_id = get_data_from_mattermost_post(data)
-            get_message = data['text']
-            channel_name = get_channel_name(data['channel_id'])
-            pattern = r'\d{2}-\d{3,5}'
-            if re.search(pattern, get_message):
-                conn = sqlite3.connect('mentions.db')
-                c = conn.cursor()
-                c.execute("SELECT * FROM mask_regions")
-                rows = c.fetchall()
-                for row in rows:
-                    region_mask = row[1]
-                    region_name = row[2]
-                    if not unique_thread_names:
-                        if region_mask in data.get('text', ''):
-                            message = func.newthread.format(get_message, region_name, channel_name, get_post_r_id)
-                            send_telegram_message(message)
-                    else:
-                        if region_mask in data.get('text', ''):
-                            message = func.newthreadunique.format(get_message, region_name, channel_name, get_post_r_id)
-                            send_telegram_message(message)
-                    c.close()
-        return ''
-
-
-def send_telegram_message(message):
-    print(message)
-    if production:
+            return self.config.implementers['msk']
+    
+    def process_message(self, message: str, channel_id: str, post_id: str, user_id: str):
+        """Обрабатывает входящее сообщение"""
+        message_hash = self._get_message_hash(message, channel_id, post_id)
+        
+        with self.lock:
+            if message_hash in self.processed_messages:
+                return
+            self.processed_messages.add(message_hash)
+        
+        if self._is_non_working_time():
+            self._send_to_mattermost(
+                channel_id,
+                "Спасибо за сообщение! Мы обработаем его в рабочее время (с 8 до 18).",
+                post_id
+            )
+            return
+        
+        self.message_queue.put({
+            'message': message,
+            'channel_id': channel_id,
+            'post_id': post_id,
+            'user_id': user_id,
+            'timestamp': time.time()
+        })
+    
+    def _get_user_info(self, user_id: str) -> dict:
+        """Получает информацию о пользователе из Mattermost"""
+        headers = {
+            'Authorization': f'Bearer {self.config.mattermost_bearer_token}',
+            'Content-Type': 'application/json'
+        }
         try:
-            bot.send_message(chat_id=prod_tg_chat, text=message)
-        except telebot.apihelper.ApiTelegramException as e:
-            func.catcherrors(e, prod_tg_chat)
-    else:
+            response = requests.get(
+                f"{self.config.mattermost_server_url}/api/v4/users/{user_id}",
+                headers=headers,
+                timeout=5
+            )
+            if response.status_code == 200:
+                return response.json()
+        except Exception as e:
+            logger.error(f"Ошибка получения информации о пользователе: {str(e)}")
+        
+        return {'username': user_id}  # Возвращаем ID если не удалось получить информацию
+
+    def _send_to_mattermost(self, channel_id: str, message: str, post_id: str = None):
+        """Отправляет сообщение в Mattermost"""
+        headers = {
+            'Authorization': f'Bearer {self.config.mattermost_bearer_token}',
+            'Content-Type': 'application/json'
+        }
+        payload = {
+            "channel_id": channel_id,
+            "message": message,
+        }
+        
+        if post_id and len(post_id) == 26:
+            payload["root_id"] = post_id
+            
         try:
-            bot.send_message(chat_id=test_tg_chat, text=message)
-        except telebot.apihelper.ApiTelegramException as e:
-            func.catcherrors(e, test_tg_chat)
+            response = requests.post(
+                f"{self.config.mattermost_server_url}/api/v4/posts",
+                headers=headers,
+                json=payload,
+                timeout=10
+            )
+            if response.status_code != 201:
+                logger.error(f"Mattermost error: {response.text}")
+        except Exception as e:
+            logger.error(f"Mattermost send error: {str(e)}")
+    
+    def _format_mattermost_link(self, post_id: str) -> str:
+        """Форматирует правильную ссылку на сообщение в Mattermost"""
+        if not post_id or len(post_id) != 26:
+            return "Ссылка недоступна"
+        
+        # Удаляем возможные пробелы или спецсимволы в post_id
+        clean_post_id = post_id.strip()
+        return f"{self.config.mattermost_server_url}/kontur/pl/{clean_post_id}"
 
+    def _send_to_telegram(self, message_data: dict):
+        """Отправляет уведомление в Telegram с корректными ссылками"""
+        # Пропускаем сообщения от бота
+        if message_data['user_id'] == self.config.bot_user_id:
+            return
 
-def post_to_mattermost(channel_id, thread_id, message):
-    post_url = '{}/api/v4/posts'.format(mattermost_server_url)
-    data = {
-        'channel_id': channel_id,
-        'message': message,
-        'root_id': thread_id
-    }
-    response = requests.post(post_url, headers=headers, json=data)
-    return response.ok
+        # Получаем информацию об отправителе
+        user_info = self._get_user_info(message_data['user_id'])
+        display_name = self._get_display_name(user_info)
+        
+        # Форматируем ссылку
+        mm_link = self._format_mattermost_link(message_data['post_id'])
+        
+        # Создаем текст сообщения
+        message_text = (
+            f"🚨 Новое сообщение во внерабочее время!\n\n"
+            f"От: <b>{display_name}</b>\n"
+            f"Сообщение: {message_data['message']}\n\n"
+            f"<a href='{mm_link}'>Перейти к сообщению в Mattermost</a>"
+        )
 
+        try:
+            # Создаем клавиатуру с кнопкой
+            markup = telebot.types.InlineKeyboardMarkup()
+            markup.add(telebot.types.InlineKeyboardButton(
+                text="Ответить в Mattermost",
+                url=mm_link
+            ))
+            
+            # Отправляем сообщение
+            sent_msg = self.telegram_bot.send_message(
+                self.config.telegram_chat_id,
+                message_text,
+                parse_mode='HTML',
+                reply_markup=markup,
+                disable_web_page_preview=True
+            )
+            
+            self.pending_responses[sent_msg.message_id] = message_data
+            Thread(target=self._check_response, args=(message_data,)).start()
+            
+        except Exception as e:
+            logger.error(f"Ошибка отправки в Telegram: {str(e)}")
 
-def get_channel_id_by_name(channel_name):
-    url = '{}/api/v4/teams/{}/channels'.format(mattermost_server_url, mattermost_team_id)
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    channels = response.json()
-    for channel in channels:
-        if channel['display_name'] == channel_name:
-            return channel['id']
-    return None
+    def _get_display_name(self, user_info: dict) -> str:
+        """Форматирует отображаемое имя пользователя"""
+        username = user_info.get('username', 'Неизвестный')
+        first_name = user_info.get('first_name', '')
+        last_name = user_info.get('last_name', '')
+        
+        if first_name or last_name:
+            return f"{first_name} {last_name}".strip()
+        return username
+    
+    def _check_response(self, message_data: dict):
+        """Проверяет, был ли ответ на сообщение"""
+        time.sleep(3600)  # Ждем 1 час
+        
+        with self.lock:
+            if message_data['post_id'] not in [msg['post_id'] for msg in self.pending_responses.values()]:
+                return
+        
+        # Если ответа не было, уведомляем руководителя
+        self._notify_manager(message_data)
+    
+    def _notify_manager(self, message_data: dict):
+        """Уведомляет руководителя об отсутствии ответа"""
+        message = f"⚠️ Никто не ответил на сообщение от {message_data['user_id']}:\n\n{message_data['message']}"
+        
+        try:
+            self.telegram_bot.send_message(
+                self.config.manager_chat_id,
+                message,
+                parse_mode='HTML'
+            )
+        except Exception as e:
+            logger.error(f"Manager notification error: {str(e)}")
+    
+    def start_processing(self, stop_event: Event):
+        """Запускает обработку сообщений"""
+        while not stop_event.is_set():
+            try:
+                message_data = self.message_queue.get(timeout=1)
+                self._send_to_telegram(message_data)
+                self.message_queue.task_done()
+            except Exception as e:
+                continue
 
+class MattermostPoller:
+    """Поллинг Mattermost на новые сообщения"""
+    def __init__(self, config: Config, processor: MessageProcessor):
+        self.config = config
+        self.processor = processor
+        self.last_post_time = datetime.now(timezone.utc) - timedelta(minutes=5)
+    
+    def poll(self, stop_event: Event):
+        """Основной цикл поллинга"""
+        headers = {
+            'Authorization': f'Bearer {self.config.mattermost_bearer_token}',
+            'Content-Type': 'application/json'
+        }
+        
+        while not stop_event.is_set():
+            try:
+                response = requests.get(
+                    f"{self.config.mattermost_server_url}/api/v4/channels/{self.config.channel_id}/posts",
+                    headers=headers,
+                    params={'since': int(self.last_post_time.timestamp() * 1000)},
+                    timeout=15
+                )
+                
+                if response.status_code == 200:
+                    self._process_messages(response.json())
+                else:
+                    logger.error(f"Mattermost poll error: {response.text}")
+                
+                time.sleep(5)
+            except Exception as e:
+                logger.error(f"Mattermost poll exception: {str(e)}")
+                time.sleep(10)
+    
+    def _process_messages(self, messages: dict):
+        """Обрабатывает полученные сообщения"""
+        for post_id in messages.get('order', []):
+            post = messages['posts'][post_id]
+            
+            if post['user_id'] == self.config.bot_user_id:
+                continue
+                
+            self.processor.process_message(
+                post['message'],
+                self.config.channel_id,
+                post_id,
+                post['user_id']
+            )
+            
+            # Обновляем время последнего сообщения
+            create_at = post.get('create_at', 0) / 1000
+            self.last_post_time = datetime.fromtimestamp(create_at, timezone.utc)
 
-def get_thread_id(thread_name, channel_id):
-    pattern = r"\d{2}-\d{3,5}"
-    get_thread_name = re.search(pattern, thread_name)
-    get_thread_id_url = "{}/api/v4/channels/{}/posts".format(mattermost_server_url, channel_id)
-    response = requests.get(get_thread_id_url, headers=headers)
-    response.raise_for_status()
-    get_thread_name = get_thread_name.group()  # 66-123
-    posts = response.json()
-    for post_id, post_data in sorted(posts["posts"].items(), reverse=True):
-        # access post properties
-        if post_data["message"] == get_thread_name:
-            return post_data["id"]
+class WebhookServer:
+    """Сервер для обработки вебхуков"""
+    def __init__(self, config: Config, processor: MessageProcessor):
+        self.app = Flask(__name__)
+        self.config = config
+        self.processor = processor
+        self._setup_routes()
+    
+    def _setup_routes(self):
+        @self.app.route('/mattermost_webhook', methods=['POST'])
+        def webhook():
+            data = request.json
+            if data:
+                post = data.get('post', {})
+                if post and post.get('user_id') != self.config.bot_user_id:
+                    self.processor.process_message(
+                        post['message'],
+                        data['channel_id'],
+                        post['id'],
+                        post['user_id']
+                    )
+            return jsonify({'status': 'ok'})
+    
+    def run(self, stop_event: Event):
+        """Запускает сервер"""
+        while not stop_event.is_set():
+            try:
+                self.app.run(port=5000, threaded=True)
+            except Exception as e:
+                logger.error(f"Webhook server error: {str(e)}")
+                time.sleep(5)
 
-
-def get_updates():
-    apiurl = 'https://api.telegram.org/bot{}/getUpdates'.format(telegram_token_prod)
-    r = requests.get(apiurl)
-    return r.json()
-
-
-# Handler for incoming updates
-@app.route('/', methods=['POST'])
-def handle_update():
-    if request.method == 'POST':
-        r = request.get_json()
-        if 'message' in r and 'text' in r['message']:
-            message_api = r['message']['text']
-            if 'reply_to_message' in r['message']:
-                print(r['message'])
-                if r['message']['reply_to_message']:
-                    print(r['message']['reply_to_message'])
-                    try:
-                        reply_text = r['message']['reply_to_message']['text']
-                        message_to_reply = ''
-                        # Check if the message is a reply to a Telegram bot message
-                        print('replied!')
-                        if message_api.startswith('/@'):
-                            thread_name = reply_text
-                            conn = sqlite3.connect('mentions.db')
-                            c = conn.cursor()
-                            c.execute("SELECT * FROM mention_mapping")
-                            rows = c.fetchall()
-                            mention_message = message_api.replace('/', '')
-                            print(mention_message)
-                            for row in rows:
-                                trigger_word = row[1]
-                                tg_username = row[2]
-                                print(trigger_word, tg_username)
-                                if tg_username == mention_message:
-                                    message_to_reply = trigger_word
-                            c.close()
-                            get_channel_name = re.search(r'на канале (\w+)', thread_name)
-                            if get_channel_name:
-                                got_channel_name_to_reply = get_channel_name.group(1)
-                                channel_id_to_reply = get_channel_id_by_name(got_channel_name_to_reply)  # channel_id
-                                #   obj=post_id - Создан тред...obj=... , чтобы отвечать на конкретный тред, если их имена дублируются
-                                if not unique_thread_names:
-                                    pattern = r'obj=(\w+)'
-                                    print(thread_name)
-                                    match = re.search(pattern, thread_name)
-                                    print(match)
-                                    if match:
-                                        get_thread_id_by_pattern = match.group(1)
-                                        post_to_mattermost(channel_id_to_reply, get_thread_id_by_pattern,
-                                                           message_to_reply)
-                                        print(get_thread_id_by_pattern)
-                                        #   если имена уникальны
-                                    else:
-                                        thread_id_to_reply = get_thread_id(thread_name,
-                                                                           channel_id_to_reply)  # thread_id
-                                        post_to_mattermost(channel_id_to_reply, thread_id_to_reply, message_to_reply)
-                            else:
-                                print('Not posted!')
-                        else:
-                            print('No reply!')
-                    except KeyError as ke:
-                        print('KeyEror: [text] not found')
-
-        return jsonify(r)
-
+def main():
+    """Основная функция запуска"""
+    stop_event = Event()
+    
+    try:
+        config = Config()
+        processor = MessageProcessor(config)
+        
+        # Запускаем обработчик сообщений
+        Thread(target=processor.start_processing, args=(stop_event,), daemon=True).start()
+        
+        # Запускаем поллинг Mattermost
+        poller = MattermostPoller(config, processor)
+        Thread(target=poller.poll, args=(stop_event,), daemon=True).start()
+        
+        # Запускаем вебхук сервер
+        webhook_server = WebhookServer(config, processor)
+        Thread(target=webhook_server.run, args=(stop_event,), daemon=True).start()
+        
+        # Запускаем Telegram бота
+        Thread(target=processor.telegram_bot.infinity_polling, daemon=True).start()
+        
+        # Основной цикл
+        while not stop_event.is_set():
+            time.sleep(1)
+            
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+        stop_event.set()
+    except Exception as e:
+        logger.error(f"Fatal error: {str(e)}")
+        stop_event.set()
 
 if __name__ == '__main__':
-    app.run()
+    main()
